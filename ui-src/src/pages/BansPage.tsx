@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Search, Plus, Undo2, Clock, Ban as BanIcon, ShieldX, Crosshair, MessageSquareWarning,
   Bug, AlertOctagon, ChevronRight, Skull, UserCog, FileText, Gavel,
@@ -21,11 +21,9 @@ function timeAgo(iso: string) {
 
 // Returns { left, total } in seconds, where left/total ∈ [0, 1] for the progress bar
 function banProgress(b: Ban): { remainingLabel: string; pct: number } | null {
-  if (b.duration === "perma" || !b.expiresAt) return null;
-  const total =
-    b.duration === "1d" ? 86_400 :
-    b.duration === "7d" ? 7 * 86_400 :
-    b.duration === "30d" ? 30 * 86_400 : 0;
+  if (!b.expiresAt) return null;
+  const total = (new Date(b.expiresAt).getTime() - new Date(b.at).getTime()) / 1000;
+  if (!Number.isFinite(total) || total <= 0) return null;
   const left = Math.max(0, Math.floor((new Date(b.expiresAt).getTime() - Date.now()) / 1000));
   const pct = Math.max(0, Math.min(1, left / total));
   const label =
@@ -56,15 +54,44 @@ function strHash(s: string) {
 export function BansPage({ onNavigatePlayers }: { onNavigatePlayers: () => void }) {
   const [filter, setFilter] = useState<Filter>("active");
   const [q, setQ] = useState("");
-  // Fetch the FULL list once, filter client-side. Bans aren't a high-volume table;
-  // fetching everything beats round-tripping on every tab click.
+  // Server returns the latest 250 entries; counts describe this loaded window.
   const [allBans, setAllBans] = useState<Ban[]>(mockBans);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [locked, setLocked] = useState(false);
+  const inFlight = useRef(false);
 
   useEffect(() => {
     let alive = true;
-    api.getBans("all").then((list) => { if (alive) setAllBans(list); }).catch(() => {});
+    api.getBans("all").then((list) => { if (alive) setAllBans(list); })
+      .catch((e) => { if (alive) { setError(String(e)); setLocked(true); } })
+      .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
   }, []);
+
+  async function refresh() {
+    if (inFlight.current) return;
+    inFlight.current = true; setLoading(true);
+    try { setAllBans(await api.getBans("all")); setError(""); setLocked(false); }
+    catch (e) { setError(String(e)); setLocked(true); }
+    finally { inFlight.current = false; setLoading(false); }
+  }
+
+  async function mutate(ban: Ban, action: "lift" | "extend") {
+    if (inFlight.current || loading || locked) return;
+    inFlight.current = true; setBusy(true); setError("");
+    let acknowledged = false;
+    try {
+      if (action === "lift") await api.banLift(Number(ban.id));
+      else await api.banExtend(Number(ban.id), 7 * 86400);
+      acknowledged = true;
+      setAllBans(await api.getBans("all"));
+    } catch (e) {
+      setError(`${acknowledged ? "Change saved, but refresh failed. " : ""}${String(e)}. Refresh bans and inspect the result before trying again.`);
+      setLocked(true);
+    } finally { inFlight.current = false; setBusy(false); }
+  }
 
   const filtered = useMemo(() => {
     const lower = q.toLowerCase();
@@ -79,7 +106,7 @@ export function BansPage({ onNavigatePlayers }: { onNavigatePlayers: () => void 
     expired: allBans.filter((b) => b.status === "expired").length,
     lifted:  allBans.filter((b) => b.status === "lifted").length,
     all:     allBans.length,
-    perma:   allBans.filter((b) => b.status === "active" && b.duration === "perma").length,
+    perma:   allBans.filter((b) => b.status === "active" && !b.expiresAt).length,
   }), [allBans]);
 
   const filterMeta: Record<Filter, { label: string; icon: typeof BanIcon; tone: string }> = {
@@ -112,6 +139,12 @@ export function BansPage({ onNavigatePlayers }: { onNavigatePlayers: () => void 
           </button>
         }
       />
+
+      <div className="mb-3 flex items-center justify-between text-xs text-zinc-400">
+        <span>Latest 250 bans. Counts and search apply to the loaded entries.</span>
+        <button disabled={busy || loading} onClick={() => void refresh()} className="rounded border border-zinc-700 px-3 py-1 disabled:opacity-40">Refresh bans</button>
+      </div>
+      {error && <div role="alert" className="mb-3 rounded border border-rose-800 p-3 text-sm text-rose-300">{error}</div>}
 
       {/* Toolbar */}
       <div className="mb-3 flex flex-wrap items-center gap-2">
@@ -168,7 +201,7 @@ export function BansPage({ onNavigatePlayers }: { onNavigatePlayers: () => void 
         </div>
 
         <div className="divide-y divide-[#1d1d22]">
-          {filtered.length === 0 ? (
+          {loading ? <div className="p-6 text-sm text-zinc-400">Loading bans…</div> : error && allBans.length === 0 ? null : filtered.length === 0 ? (
             <div className="flex flex-col items-center justify-center gap-2 py-14 text-center">
               <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[#1d1d23] ring-1 ring-[#272730]">
                 <Gavel className="h-4 w-4 text-zinc-500" strokeWidth={2} />
@@ -176,18 +209,18 @@ export function BansPage({ onNavigatePlayers }: { onNavigatePlayers: () => void 
               <div className="text-[12.5px] font-medium text-zinc-300">No bans match this filter</div>
               <div className="text-[11px] text-zinc-500">Try a different tab, or clear the search.</div>
             </div>
-          ) : filtered.map((b) => <BanRow key={b.id} ban={b} />)}
+          ) : filtered.map((b) => <BanRow key={b.id} ban={b} disabled={busy || loading || locked} onAction={(action) => void mutate(b, action)} />)}
         </div>
       </section>
     </>
   );
 }
 
-function BanRow({ ban: b }: { ban: Ban }) {
+function BanRow({ ban: b, disabled, onAction }: { ban: Ban; disabled: boolean; onAction: (action: "lift" | "extend") => void }) {
   const rm = reasonMeta(b.reason);
   const RIcon = rm.icon;
   const prog = banProgress(b);
-  const isPerma = b.duration === "perma";
+  const isPerma = !b.expiresAt;
 
   return (
     <div className="motion-soft group relative grid grid-cols-[minmax(0,1.7fr)_minmax(0,2fr)_120px_minmax(0,1.2fr)_140px_120px] items-center gap-4 px-4 py-3 hover:bg-[#18181c]">
@@ -280,18 +313,20 @@ function BanRow({ ban: b }: { ban: Ban }) {
       {b.status === "active" && (
         <div className="pointer-events-none absolute right-4 top-1/2 z-10 -translate-y-1/2 opacity-0 transition-opacity duration-150 group-hover:pointer-events-auto group-hover:opacity-100">
           <div className="flex items-center gap-0.5 rounded-lg border border-[#383841] bg-[#16161a] p-1 shadow-[0_4px_16px_-2px_rgba(0,0,0,0.7)] backdrop-blur-sm">
-            <ActionBtn
+            {!isPerma && <ActionBtn
               icon={Clock} label="+7d"
+              disabled={disabled}
               onClick={(e) => {
                 e.stopPropagation();
-                void api.banExtend(Number(b.id), 7 * 86400);
+                onAction("extend");
               }}
-            />
+            />}
             <ActionBtn
               icon={Undo2} label="Lift" tone="good"
+              disabled={disabled}
               onClick={(e) => {
                 e.stopPropagation();
-                void api.banLift(Number(b.id));
+                onAction("lift");
               }}
             />
           </div>
@@ -301,8 +336,8 @@ function BanRow({ ban: b }: { ban: Ban }) {
   );
 }
 
-function ActionBtn({ icon: Icon, label, tone, onClick }: {
-  icon: typeof BanIcon; label: string; tone?: "good"; onClick: (e: React.MouseEvent) => void;
+function ActionBtn({ icon: Icon, label, tone, onClick, disabled }: {
+  icon: typeof BanIcon; label: string; tone?: "good"; onClick: (e: React.MouseEvent) => void; disabled: boolean;
 }) {
   const toneCls = tone === "good"
     ? "text-emerald-300/90 hover:bg-emerald-500/10 hover:text-emerald-200"
@@ -310,6 +345,7 @@ function ActionBtn({ icon: Icon, label, tone, onClick }: {
   return (
     <button
       onClick={onClick}
+      disabled={disabled}
       title={label}
       className={cn("motion-soft flex h-6 items-center gap-1 rounded-md px-1.5 text-[10.5px] font-medium leading-none", toneCls)}
     >

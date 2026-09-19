@@ -5,11 +5,11 @@ import App from './App.tsx'
 import { ReportForm } from './components/ReportForm'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { IS_NUI, closeNui, onNuiMessage } from './lib/nui'
-import { ItemsCatalogProvider } from './lib/itemsCatalog'
+import { ItemsCatalogProvider } from './components/ItemsCatalogProvider'
 
 type Mode = 'admin' | 'report';
 
-function Shell() {
+export function Shell() {
   // Dev (browser): start as 'admin' immediately. NUI: wait for a message.
   const [mode, setMode] = useState<Mode | null>(IS_NUI ? null : 'admin');
 
@@ -23,7 +23,9 @@ function Shell() {
 
   if (mode === null) return null;
   if (mode === 'report') return <ReportForm />;
-  return <App />;
+  // Mount the catalog with the visible admin session, not the hidden NUI page.
+  // Inventory restarts and newly registered add-on items must be visible on reopen.
+  return <ItemsCatalogProvider><App /></ItemsCatalogProvider>;
 }
 
 const root = document.getElementById('root')!
@@ -46,9 +48,7 @@ if (!IS_NUI) {
 createRoot(root).render(
   <StrictMode>
     <ErrorBoundary>
-      <ItemsCatalogProvider>
-        <Shell />
-      </ItemsCatalogProvider>
+      <Shell />
     </ErrorBoundary>
   </StrictMode>,
 )

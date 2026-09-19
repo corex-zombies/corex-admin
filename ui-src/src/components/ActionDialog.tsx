@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   X, Hand, Ban, Coins, Send, AlertTriangle,
 } from "lucide-react";
@@ -48,6 +48,7 @@ export function ActionDialog({ kind, targets, onClose, onDone }: Props) {
   const [moneyAmount, setMoneyAmount] = useState(1000);
   const [submitting, setSubmitting]   = useState(false);
   const [error, setError]             = useState<string | null>(null);
+  const attempted = useRef(false);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
@@ -59,7 +60,7 @@ export function ActionDialog({ kind, targets, onClose, onDone }: Props) {
   const targetCount = broadcastAll ? "All online" : `${targets.length} player${targets.length === 1 ? "" : "s"}`;
 
   const canConfirm = (() => {
-    if (submitting) return false;
+    if (submitting || attempted.current) return false;
     if (kind === "warn" || kind === "kick" || kind === "ban") {
       if (!reason.trim()) return false;
       if (targets.length === 0) return false;
@@ -70,23 +71,33 @@ export function ActionDialog({ kind, targets, onClose, onDone }: Props) {
   })();
 
   const handleConfirm = async () => {
-    if (!canConfirm) return;
+    if (!canConfirm || attempted.current) return;
+    attempted.current = true;
     setSubmitting(true);
     setError(null);
+    const confirmed: number[] = [];
+    let pending: number | null = null;
     try {
-      for (const t of targets.length > 0 ? targets : [{ id: -1 } as Player]) {
-        switch (kind) {
-          case "warn":     await api.warn(t.id, reason); break;
-          case "kick":     await api.kick(t.id, reason); break;
-          case "ban":      await api.banCreate(t.id, banDuration, reason); break;
-          case "money":    await api.giveMoney(t.id, moneyType, moneyAmount); break;
-          case "announce": await api.announce(message, broadcastAll ? undefined : targets.map((x) => x.id)); break;
+      if (kind === "announce") {
+        await api.announce(message, broadcastAll ? undefined : targets.map((x) => x.id));
+      } else {
+        for (const t of targets) {
+          pending = t.id;
+          switch (kind) {
+            case "warn":  await api.warn(t.id, reason); break;
+            case "kick":  await api.kick(t.id, reason); break;
+            case "ban":   await api.banCreate(t.id, banDuration, reason); break;
+            case "money": await api.giveMoney(t.id, moneyType, moneyAmount); break;
+          }
+          confirmed.push(t.id);
         }
       }
       onDone();
       onClose();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Action failed");
+      const detail = e instanceof Error ? e.message : "Action failed";
+      setError(`${detail}. Confirmed: ${confirmed.length ? confirmed.map(id => `#${id}`).join(", ") : "none"}. ` +
+        `${pending !== null ? `Stopped at #${pending}. ` : ""}Check the action log and current state before submitting again; an unconfirmed reply does not prove the action was rolled back.`);
     } finally {
       setSubmitting(false);
     }

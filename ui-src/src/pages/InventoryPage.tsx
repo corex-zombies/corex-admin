@@ -4,32 +4,38 @@ import {
   Coins, Weight, AlertTriangle,
 } from "lucide-react";
 import { Avatar } from "@/components/Avatar";
-import { ItemIcon, imageFor, categoryFallbackIcon } from "@/components/ItemIcon";
-import { StatusDot, statusLabel } from "@/components/StatusDot";
+import { ItemIcon } from "@/components/ItemIcon";
+import { ProviderItemImage } from "@/components/ProviderItemImage";
+import { StatusDot } from "@/components/StatusDot";
 import { PageHeader } from "@/components/PageHeader";
 import {
   players as mockPlayers,
   categoryLabels, rarityMeta, type Player, type Item, type ItemCategory, type InventorySlot,
 } from "@/lib/data";
 import { api } from "@/lib/api";
-import { useItemsCatalog } from "@/lib/itemsCatalog";
+import { useItemsCatalog } from "@/lib/itemsCatalogContext";
+import { statusLabel } from "@/lib/statusMeta";
 import { cn } from "@/lib/cn";
 
 const FALLBACK_GRID_SLOTS = 80; // matches corex-inventory's default 8×10 grid
 const fmt = (n: number) => n.toLocaleString("en-US");
 
-export function InventoryPage() {
+export function InventoryPage({ initialTargetId = null }: { initialTargetId?: number | null }) {
   const catalog = useItemsCatalog();
   const allItems: Item[] = Array.from(catalog.values());
 
   const [q, setQ] = useState("");
   const [allPlayers, setAllPlayers] = useState<Player[]>(mockPlayers);
-  const [selectedId, setSelectedId] = useState<number | null>(mockPlayers[0]?.id ?? null);
+  const [selectedId, setSelectedId] = useState<number | null>(initialTargetId ?? mockPlayers[0]?.id ?? null);
   // Live grid size pulled from corex-inventory's Config.GridWidth × GridHeight.
   // Falls back to 80 so admins don't see a "0 slots" state if the overview
   // call hasn't resolved yet.
   const [gridSlots, setGridSlots] = useState<number>(FALLBACK_GRID_SLOTS);
-  // Local mutable copy of inventories so admin can give/remove without a refetch
+  const [loading, setLoading] = useState(true);
+  const [mutating, setMutating] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const mutationPending = useRef(false);
+  // Last server-confirmed contents; never invent a successful item mutation.
   const [invMap, setInvMap] = useState<Record<number, InventorySlot[]>>(() =>
     Object.fromEntries(mockPlayers.map((p) => [p.id, [...p.inventory]])),
   );
@@ -46,7 +52,7 @@ export function InventoryPage() {
           list.forEach((p) => { if (!next[p.id]) next[p.id] = p.inventory ?? []; });
           return next;
         });
-        if (list.length > 0 && (selectedId === null || !list.find((p) => p.id === selectedId))) {
+        if (list.length > 0 && selectedId === null) {
           setSelectedId(list[0].id);
         }
       })
@@ -58,80 +64,75 @@ export function InventoryPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    if (selectedId === null) return;
+    let currentSelection = true;
+    setLoading(true);
+    setActionError(null);
+    api.getPlayer(selectedId).then(player => {
+      if (!currentSelection) return;
+      if (!player) throw new Error("Selected player is no longer online");
+      setInvMap(m => ({...m, [selectedId]: player.inventory ?? []}));
+      setAllPlayers(list => list.map(p => p.id === selectedId ? player : p));
+      setLoading(false);
+    }).catch(error => {
+      if (currentSelection) setActionError(error instanceof Error ? error.message : "Inventory could not be loaded");
+    });
+    return () => { currentSelection = false; };
+  }, [selectedId]);
+
   const filtered = useMemo(() => {
     const lower = q.toLowerCase();
     return allPlayers.filter((p) => !q || p.name.toLowerCase().includes(lower) || String(p.id).includes(lower) || p.identifier.toLowerCase().includes(lower));
   }, [q, allPlayers]);
 
-  const selected = allPlayers.find((p) => p.id === selectedId) ?? allPlayers[0];
+  const selected = allPlayers.find((p) => p.id === selectedId);
   const inv = selected ? (invMap[selected.id] ?? []) : [];
   const totalWeight = inv.reduce((s, slot) => s + ((catalog.get(slot.itemId)?.weight ?? 0) * slot.count), 0);
   const used = inv.length;
 
-  const giveItem = (item: Item, count: number) => {
-    if (!selected) return;
-    // Optimistic local update
-    setInvMap((m) => {
-      const cur = [...(m[selected.id] ?? [])];
-      if (item.stackable) {
-        const idx = cur.findIndex((s) => s.itemId === item.id);
-        if (idx >= 0) cur[idx] = { ...cur[idx], count: cur[idx].count + count };
-        else cur.push({ itemId: item.id, count });
-      } else {
-        for (let i = 0; i < count; i++) cur.push({ itemId: item.id, count: 1 });
+  const mutateInventory = async (operations: Array<() => Promise<unknown>>) => {
+    if (!selected || mutationPending.current || loading) return;
+    const id = selected.id;
+    mutationPending.current = true;
+    setMutating(true);
+    setActionError(null);
+    try {
+      for (const operation of operations) await operation();
+    } catch (error) {
+      setActionError(`${error instanceof Error ? error.message : "Inventory action failed"}. The operation stopped; check the refreshed inventory and action log before trying again.`);
+    } finally {
+      try {
+        const current = await api.getPlayer(id);
+        if (!current) throw new Error("Player is no longer online");
+        setInvMap(m => ({...m, [id]: current.inventory ?? []}));
+        setAllPlayers(list => list.map(p => p.id === id ? current : p));
+      } catch {
+        setActionError(previous => `${previous ?? ""} Inventory refresh failed; contents shown may be stale. Reopen the editor before making another change.`);
+        setLoading(true);
       }
-      return { ...m, [selected.id]: cur };
-    });
-    // Fire the real action to corex-inventory; rollback on failure.
-    api.giveItem(selected.id, item.id, count).catch(() => {
-      setInvMap((m) => {
-        const cur = [...(m[selected.id] ?? [])];
-        if (item.stackable) {
-          const idx = cur.findIndex((s) => s.itemId === item.id);
-          if (idx >= 0) {
-            const newCount = cur[idx].count - count;
-            if (newCount <= 0) cur.splice(idx, 1);
-            else cur[idx] = { ...cur[idx], count: newCount };
-          }
-        } else {
-          for (let i = 0; i < count; i++) {
-            const idx = cur.findIndex((s) => s.itemId === item.id);
-            if (idx >= 0) cur.splice(idx, 1);
-          }
-        }
-        return { ...m, [selected.id]: cur };
-      });
-    });
+      mutationPending.current = false;
+      setMutating(false);
+    }
+  };
+
+  const giveItem = (item: Item, count: number) => {
+    if (!selected || !Number.isSafeInteger(count) || count <= 0) return;
+    const id = selected.id;
+    void mutateInventory([() => api.giveItem(id, item.id, count)]);
   };
 
   const removeSlot = (idx: number) => {
     if (!selected) return;
-    const slot = (invMap[selected.id] ?? [])[idx];
-    if (!slot) return;
-    // Optimistic local update
-    setInvMap((m) => {
-      const cur = [...(m[selected.id] ?? [])];
-      cur.splice(idx, 1);
-      return { ...m, [selected.id]: cur };
-    });
-    api.removeItem(selected.id, slot.itemId, slot.count).catch(() => {
-      // Rollback on failure
-      setInvMap((m) => {
-        const cur = [...(m[selected.id] ?? [])];
-        cur.splice(idx, 0, slot);
-        return { ...m, [selected.id]: cur };
-      });
-    });
+    const id = selected.id;
+    const slot = inv[idx];
+    if (slot) void mutateInventory([() => api.removeItem(id, slot.itemId, slot.count)]);
   };
 
   const clearAll = () => {
     if (!selected) return;
-    const prev = invMap[selected.id] ?? [];
-    setInvMap((m) => ({ ...m, [selected.id]: [] }));
-    // Mirror to server: remove every slot (best-effort; we don't have a single bulk-clear endpoint)
-    prev.forEach((slot) => {
-      void api.removeItem(selected.id, slot.itemId, slot.count).catch(() => {});
-    });
+    const id = selected.id;
+    void mutateInventory(inv.map(slot => () => api.removeItem(id, slot.itemId, slot.count)));
   };
 
   // Empty state when there are no players online (production with no live data yet).
@@ -176,6 +177,7 @@ export function InventoryPage() {
               return (
                 <li key={p.id}>
                   <button
+                    disabled={mutating}
                     onClick={() => setSelectedId(p.id)}
                     className={cn(
                       "motion-soft flex w-full items-center gap-2.5 px-3 py-2 text-left",
@@ -203,7 +205,10 @@ export function InventoryPage() {
         </aside>
 
         {/* Editor */}
-        <section className="space-y-4">
+        <fieldset disabled={loading || mutating} className="min-w-0 space-y-4">
+          {actionError && <div role="alert" className="rounded-md border border-rose-700/40 bg-rose-950/40 p-3 text-sm text-rose-300">{actionError}</div>}
+          {loading && !actionError && <p role="status">Loading current inventory…</p>}
+          {mutating && <p role="status">Applying change and refreshing inventory…</p>}
           {/* Player summary header */}
           <header className="flex items-center justify-between gap-4 rounded-xl border border-[#252529] bg-[#141418] p-3.5">
             <div className="flex items-center gap-3">
@@ -247,12 +252,18 @@ export function InventoryPage() {
                 const slot = inv[i];
                 if (!slot) return <EmptySlot key={i} />;
                 const item = catalog.get(slot.itemId);
-                if (!item) return <EmptySlot key={i} />;
+                if (!item) return (
+                  <div key={i} className="flex aspect-square min-w-0 flex-col justify-between rounded-md border border-amber-700/40 bg-[#141418] p-2 text-xs">
+                    <span className="break-all text-zinc-200">{slot.itemId}</span>
+                    <span className="text-amber-300">×{slot.count} · Item details unavailable</span>
+                    <button className="text-left text-rose-300" onClick={() => removeSlot(i)}>Remove</button>
+                  </div>
+                );
                 return <FilledSlot key={i} item={item} count={slot.count} onRemove={() => removeSlot(i)} />;
               })}
             </div>
           </section>
-        </section>
+        </fieldset>
       </div>
     </>
   );
@@ -459,9 +470,7 @@ function EmptySlot() {
 
 function FilledSlot({ item, count, onRemove }: { item: Item; count: number; onRemove: () => void }) {
   const [hovered, setHovered] = useState(false);
-  const [imgErrored, setImgErrored] = useState(false);
   const r = rarityMeta[item.rarity];
-  const Fallback = categoryFallbackIcon(item.category);
 
   return (
     <div
@@ -486,18 +495,12 @@ function FilledSlot({ item, count, onRemove }: { item: Item; count: number; onRe
       {/* Big image — fills the slot, label sits at bottom */}
       <div className="relative flex h-full w-full flex-col p-1.5">
         <div className="flex min-h-0 flex-1 items-center justify-center">
-          {imgErrored || !imageFor(item) ? (
-            <Fallback className={cn("h-1/2 w-1/2", r.color)} strokeWidth={1.5} />
-          ) : (
-            <img
-              src={imageFor(item) || undefined}
-              alt={item.label}
-              draggable={false}
-              loading="lazy"
-              onError={() => setImgErrored(true)}
-              className="h-full w-full object-contain drop-shadow-[0_2px_4px_rgba(0,0,0,0.4)]"
-            />
-          )}
+          <ProviderItemImage
+            item={item}
+            fallbackClassName={cn("h-1/2 w-1/2", r.color)}
+            fallbackStrokeWidth={1.5}
+            imageClassName="h-full w-full object-contain drop-shadow-[0_2px_4px_rgba(0,0,0,0.4)]"
+          />
         </div>
         <div className="line-clamp-1 pt-1 text-center text-[10.5px] font-medium text-zinc-200">
           {item.label}

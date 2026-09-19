@@ -24,7 +24,7 @@ Config.AllowedAces = {
 }
 
 Config.UseCorexMetadataFlag = true
-Config.StaffMetadataKey = 'isStaff'   -- truthy = allowed
+Config.StaffMetadataKey = 'isStaff'   -- exact true, 1 or '1' = allowed
 
 -----------------------------------------------------------------------
 -- TRIGGERS

@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Sidebar } from "./components/Sidebar";
 import { Topbar } from "./components/Topbar";
-import { PlayerDrawer } from "./components/PlayerDrawer";
+import { PlayerDrawer, type MoneyInput } from "./components/PlayerDrawer";
 import { CommandPalette } from "./components/CommandPalette";
 import { UndoToast, type UndoEvent } from "./components/UndoToast";
 import { ActionDialog, type ActionKind } from "./components/ActionDialog";
@@ -14,7 +14,7 @@ import { ReportsPage } from "./pages/ReportsPage";
 import { WorldPage } from "./pages/WorldPage";
 import { LogsPage } from "./pages/LogsPage";
 import { StaffPage } from "./pages/StaffPage";
-import { players, bans, type Player } from "./lib/data";
+import type { Player } from "./lib/data";
 import { api } from "./lib/api";
 import type { PageId } from "./lib/nav";
 
@@ -32,24 +32,42 @@ const labels: Record<string, (n: string) => string> = {
 
 // Actions that fire immediately (no extra input needed).
 // Destructive/parameterised actions (warn/kick/ban/money/announce) go through ActionDialog.
-async function dispatchInstant(action: string, p: Player): Promise<void> {
+async function dispatchInstant(action: string, p: Player, money?: MoneyInput): Promise<void> {
   switch (action) {
     case "revive":   return void (await api.revive(p.id));
     case "tp":       return void (await api.teleport(p.id));
     case "spectate": return void (await api.spectate(p.id));
-    default: return;
+    case "money":
+    case "set_money": {
+      if (!money || !Number.isSafeInteger(money.amount) || money.amount < 0
+          || (money.kind !== 'cash' && money.kind !== 'bank')) throw new Error('Invalid money input');
+      if (action === "money") await api.giveMoney(p.id, money.kind, money.amount);
+      else await api.setMoney(p.id, money.kind, money.amount);
+      return;
+    }
+    default: throw new Error('Unsupported action');
   }
 }
 
 export default function App() {
   const [page, setPage] = useState<PageId>("overview");
   const [selected, setSelected] = useState<Player | null>(null);
+  const [inventoryTarget, setInventoryTarget] = useState<number | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [palettePlayers, setPalettePlayers] = useState<Player[]>([]);
   const [toasts, setToasts] = useState<UndoEvent[]>([]);
   // Lifted action dialog state — opened from drawer/overview/players
   const [actionDialog, setActionDialog] = useState<{ kind: ActionKind; targets: Player[] } | null>(null);
   // Live open-reports counter for the Topbar bell badge.
   const [openReports, setOpenReports] = useState(0);
+
+  useEffect(() => {
+    if (!paletteOpen) return;
+    let alive = true;
+    setPalettePlayers([]);
+    api.getPlayers().then(list => { if (alive) setPalettePlayers(list); }).catch(() => {});
+    return () => { alive = false; };
+  }, [paletteOpen]);
 
   useEffect(() => {
     let alive = true;
@@ -71,25 +89,36 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [selected]);
 
-  void bans; // mock-only; topbar uses live `openReports` instead
-  void useMemo; // kept for future memoised selectors
-
   const pushUndo = useCallback((message: string) => {
     const id = `t_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    setToasts((t) => [...t, { id, message, expiresAt: Date.now() + 30_000, onUndo: () => {} }]);
+    setToasts((t) => [...t, { id, message, expiresAt: Date.now() + 30_000 }]);
   }, []);
 
-  const handleAction = useCallback((action: string, p?: Player) => {
+  const handleAction = useCallback((action: string, p?: Player, money?: MoneyInput) => {
     if (!p) return;
+    if (action === "give_item") {
+      setInventoryTarget(p.id); setPage("inventory"); setSelected(null);
+      return;
+    }
     // Destructive/parameterised actions → open dialog (needs input).
-    if (action === "kick" || action === "warn" || action === "ban" || action === "money") {
+    if (action === "kick" || action === "warn" || action === "ban" || (action === "money" && !money)) {
       setActionDialog({ kind: action, targets: [p] });
       return;
     }
-    // Instant actions → fire & confirm with toast.
+    // Only a successful backend acknowledgement can produce a success toast.
     const label = labels[action]?.(p.name);
-    if (label) pushUndo(label);
-    dispatchInstant(action, p).catch((err) => {
+    dispatchInstant(action, p, money).then(() => {
+      if (label) pushUndo(label);
+      if (action === 'revive' || action === 'money' || action === 'set_money') {
+        api.getPlayer(p.id).then(updated => {
+          setSelected(current => current?.id === p.id && current.identifier === p.identifier
+            ? (updated?.identifier === p.identifier ? updated : null) : current);
+        }).catch(() => {
+          setSelected(current => current?.id === p.id && current.identifier === p.identifier ? null : current);
+          pushUndo('Action succeeded, but player data could not be refreshed. Reopen the player to check.');
+        });
+      }
+    }).catch((err) => {
       pushUndo(`Failed: ${err?.message ?? action}`);
     });
   }, [pushUndo]);
@@ -152,7 +181,7 @@ export default function App() {
                 >
                   {page === "overview"  && <OverviewPage selected={selected} setSelected={setSelected} onPaletteOpen={() => setPaletteOpen(true)} onNavigate={setPage} onAnnounce={openAnnounce} />}
                   {page === "players"   && <PlayersPage onSelect={(p) => setSelected(p)} onAction={handleAction} onAnnounce={openAnnounce} />}
-                  {page === "inventory" && <InventoryPage />}
+                  {page === "inventory" && <InventoryPage key={inventoryTarget ?? 'default'} initialTargetId={inventoryTarget} />}
                   {page === "bans"      && <BansPage onNavigatePlayers={() => setPage("players")} />}
                   {page === "reports"   && <ReportsPage />}
                   {page === "world"     && <WorldPage />}
@@ -168,7 +197,7 @@ export default function App() {
           player={selected}
           onClose={() => setSelected(null)}
           onAction={handleAction}
-          onOpenInventory={() => { setPage("inventory"); setSelected(null); }}
+          onOpenInventory={(p) => { setInventoryTarget(p.id); setPage("inventory"); setSelected(null); }}
         />
 
         {/* Toasts live INSIDE the admin window so they can't spill onto the
@@ -185,7 +214,7 @@ export default function App() {
       <CommandPalette
         open={paletteOpen}
         onClose={() => setPaletteOpen(false)}
-        players={players}
+        players={palettePlayers}
         onAction={handlePaletteAction}
       />
 

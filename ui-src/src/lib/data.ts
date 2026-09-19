@@ -2,8 +2,8 @@
 //
 // PRODUCTION shape:
 //   - Types and UI constants are always shipped.
-//   - The static items catalog (mirror of corex-inventory/shared/items.lua) is
-//     always shipped — it's real, accurate, and small.
+//   - The item catalog is loaded from the active server provider, not assumed
+//     to match a static development sample.
 //   - Mock arrays for players/bans/etc. live in ./mock and are re-exported
 //     here ONLY in dev mode. In a prod bundle the conditional is folded to
 //     `false`, the dead branch is dropped, and the mock module is tree-shaken.
@@ -34,8 +34,10 @@ export type Item = {
   maxStack?: number;
   category: ItemCategory;
   rarity: Rarity;
-  /** Filename inside corex-inventory's html/images/ (case-sensitive). */
+  /** Provider-specific filename, retained for inventories that expose one. */
   image?: string;
+  /** Fully resolved image URL supplied by the active inventory provider. */
+  imageUrl?: string;
 };
 
 export type InventorySlot = { itemId: string; count: number };
@@ -91,7 +93,7 @@ export type Ban = {
   by: string;
   at: string;
   reason: string;
-  duration: "1d" | "7d" | "30d" | "perma";
+  duration: string;
   expiresAt?: string;
   status: "active" | "expired" | "lifted";
 };
@@ -166,7 +168,7 @@ export const categoryLabels: Record<ItemCategory, string> = {
 
 // ----- Static items catalog (real, mirrors corex-inventory) -------------
 
-export const items: Item[] = devMock.items;
+export const items: Item[] = IS_DEV ? devMock.items : [];
 export const itemsById: Record<string, Item> = Object.fromEntries(items.map((i) => [i.id, i]));
 
 // ----- Mock arrays — dev-only, EMPTY in production ----------------------

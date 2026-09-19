@@ -8,15 +8,19 @@ import {
 import { Avatar } from "./Avatar";
 import { ItemIcon } from "./ItemIcon";
 import { StatBar } from "./StatBar";
-import { StatusDot, statusLabel } from "./StatusDot";
+import { StatusDot } from "./StatusDot";
+import { statusLabel } from "@/lib/statusMeta";
 import { type Player } from "@/lib/data";
-import { useItemsCatalog } from "@/lib/itemsCatalog";
+import { useItemsCatalog } from "@/lib/itemsCatalogContext";
 import { cn } from "@/lib/cn";
+
+export type MoneyInput = { kind: 'cash' | 'bank'; amount: number };
+type PlayerAction = (action: string, player: Player, money?: MoneyInput) => void;
 
 type Props = {
   player: Player | null;
   onClose: () => void;
-  onAction: (action: string, p: Player) => void;
+  onAction: PlayerAction;
   onOpenInventory?: (p: Player) => void;
 };
 
@@ -92,7 +96,7 @@ function Header({ player, onClose }: { player: Player; onClose: () => void }) {
 // omit stats; we never want the drawer to crash because of one missing field.
 const DEFAULT_STATS = { hunger: 100, thirst: 100, stress: 0, infection: 0, bleeding: 0, sick: 0, cold: 0, poison: 0 };
 
-function Body({ player, onAction, onOpenInventory }: { player: Player; onAction: (a: string, p: Player) => void; onOpenInventory: () => void }) {
+function Body({ player, onAction, onOpenInventory }: { player: Player; onAction: PlayerAction; onOpenInventory: () => void }) {
   const stats = { ...DEFAULT_STATS, ...(player.stats ?? {}) };
   const catalog = useItemsCatalog();
   return (
@@ -241,7 +245,7 @@ function Body({ player, onAction, onOpenInventory }: { player: Player; onAction:
   );
 }
 
-function MoneySection({ player, onAction }: { player: Player; onAction: (a: string, p: Player) => void }) {
+function MoneySection({ player, onAction }: { player: Player; onAction: PlayerAction }) {
   const [type, setType] = useState<"cash" | "bank">("cash");
   const [op, setOp] = useState<"give" | "set">("give");
   const [amount, setAmount] = useState(1000);
@@ -283,7 +287,7 @@ function MoneySection({ player, onAction }: { player: Player; onAction: (a: stri
             className="h-7 flex-1 rounded-md border border-[#2f2f38] bg-[#141418] px-2 font-mono text-[12.5px] tabular text-zinc-100 outline-none focus:border-zinc-700"
           />
           <button
-            onClick={() => onAction(op === "give" ? "money" : "set_money", player)}
+            onClick={() => onAction(op === "give" ? "money" : "set_money", player, {kind:type, amount})}
             className="motion-soft flex h-7 items-center gap-1 rounded-md border border-emerald-700/40 bg-emerald-500/[0.08] px-3 text-[11.5px] font-medium text-emerald-300 hover:border-emerald-600/60 hover:bg-emerald-500/[0.12]"
           >
             <Plus className="h-3 w-3" strokeWidth={2.25} />

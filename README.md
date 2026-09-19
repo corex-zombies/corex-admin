@@ -16,7 +16,7 @@ Part of the [COREX Framework](https://github.com/corex-zombies).
 
 - **Players** — live list with mugshots, vitals, money, inventory, warnings, bans, playtime, joined date, zone, ping, skill points, and zombie-kill count.
 - **Actions** — kick, ban, warn, revive (full heal), teleport to player, **long-range spectate** (auto-warps you into the target's scope from anywhere on the map), give/set money, give/remove items, server-wide announce.
-- **Inventory editor** — pulls live items from `corex-inventory`, supports any rarity and category. Add or remove items with optimistic UI.
+- **Inventory editor** — pulls live items from whichever inventory CoreX has, supports any rarity and category. Add or remove items with optimistic UI.
 - **Bans** — DB-backed `corex_bans` table with status (active / expired / lifted), filterable, with extend/lift actions.
 - **Reports** — players can file reports via `/report`; admins see them in the panel, mark them resolved or dismissed.
 - **Overview** — live player count, alive zombies (from `corex-zombies`), active red zones (from `corex-redzones`), current weather (from `corex-weather`), recent admin actions feed.
@@ -31,7 +31,7 @@ Part of the [COREX Framework](https://github.com/corex-zombies).
 
 Drop the folder into:
 ```
-server-file/resources/[corex]/corex-admin/
+server-data/resources/[corex]/corex-admin/
 ```
 
 ### Required dependencies
@@ -39,7 +39,6 @@ server-file/resources/[corex]/corex-admin/
 | Resource | Why | Where |
 |---|---|---|
 | **corex-core** | player object, metadata, money, state | https://github.com/corex-zombies/corex-core |
-| **corex-inventory** | inventory display + item give/remove + item icon source | https://github.com/corex-zombies/corex-inventory |
 | **ox_lib** | NUI helpers, callbacks, notifications, keymapping | https://github.com/overextended/ox_lib |
 | **oxmysql** | DB queries (bans, reports, action log) | https://github.com/overextended/oxmysql |
 
@@ -47,6 +46,8 @@ server-file/resources/[corex]/corex-admin/
 
 | Resource | Adds |
 |---|---|
+| **an inventory** | Inventory display and item give/remove. The panel asks CoreX for whichever inventory is installed, so `corex-inventory` is the default rather than a requirement — https://github.com/corex-zombies/corex-inventory |
+| **Inventory provider capabilities** | Grid size, catalog and image URLs come through the selected CoreX inventory provider. The shipped UI uses the server-supplied `imageUrl`; if an image is absent or fails, it displays a category icon. Unsupported provider operations remain unavailable; installing this panel does not add those operations to an inventory. |
 | **MugShotBase64** | Player face thumbnails — https://github.com/BaziForYou/MugShotBase64 |
 | **screenshot-basic** | Attach JPEG of the target to Discord audit logs — https://github.com/citizenfx/screenshot-basic |
 | **corex-skills** | "Skill pts" field in player History |
@@ -65,7 +66,7 @@ ensure ox_lib
 ensure MugShotBase64        # optional
 ensure screenshot-basic     # optional
 ensure corex-core
-ensure corex-inventory
+ensure corex-inventory      # or any other inventory that registers with CoreX
 ensure corex-admin
 ```
 
@@ -108,6 +109,8 @@ exports['corex-core']:SetMetaData(src, 'isStaff', true)
 ```
 
 Useful for in-game promotion flows where you don't want to edit `server.cfg` for every new staff member. The metadata key is `Config.StaffMetadataKey`.
+
+Only exact `true`, `1` or `'1'` grants metadata-based access. Never accept this flag from client-submitted data. Set `Config.UseCorexMetadataFlag = false` if staff access should use ACE alone. A txAdmin login does not automatically add the player's identifier to an in-game ACE group.
 
 ---
 
@@ -186,7 +189,7 @@ A small overlay shows while spectating with a `[X] Stop` hint.
 | Panel won't open after a crash | Run `/admin-reset` then `/admin` |
 | Discord webhook returns 400 | Check the webhook URL is current; the resource auto-retries without screenshot |
 | Screenshots missing in Discord | Verify `screenshot-basic` is started and `Config.CaptureEvidenceScreenshots = true` |
-| Item images don't load | Verify `corex-inventory` is started — the panel pulls images from `https://cfx-nui-corex-inventory/html/images/` |
+| Item images don't load | Check the selected provider's catalog `imageUrl`, that its asset resource is started, and that the path exists. The shipped UI uses that URL and falls back to an icon on failure; it does not invent a native-inventory URL for another provider. |
 | Zone shows `Open world` | The client reports its location every 5 s after spawn; wait one cycle or move once |
 
 ---
@@ -194,6 +197,20 @@ A small overlay shows while spectating with a `[X] Stop` hint.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Editing the panel UI
+
+Server owners run the included `web/` build; no JavaScript development tools are needed to operate the panel. Developers need Node.js and [Bun](https://bun.com/docs/installation). Keep the complete `ui-src/` source and its `bun.lock`, which records the dependency versions.
+
+From the resource directory:
+
+```sh
+cd ui-src
+bun install --frozen-lockfile
+bun run build
+```
+
+The frozen installation preserves the versions recorded in `bun.lock`. The build type-checks the source and rebuilds `../web/`; keep the generated HTML and matching hashed assets together. Do not publish `node_modules/`, compiler caches, local preview logs or temporary audit builds. Browser preview/mock data is development-only and does not prove connected FiveM actions.
 
 ## Author
 

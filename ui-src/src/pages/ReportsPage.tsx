@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Receipt, Search, Check, X as XIcon, AlertOctagon, MessageSquareWarning,
   Bug, Crosshair, ShieldX, ChevronRight,
@@ -31,11 +31,11 @@ export function ReportsPage() {
   const [q, setQ] = useState("");
   const [reports, setReports] = useState<Report[]>([]);
 
-  const refresh = () => {
+  const refresh = useCallback(() => {
     api.getReports(filter).then(setReports).catch(() => {});
-  };
+  }, [filter]);
 
-  useEffect(() => { refresh(); /* eslint-disable-next-line */ }, [filter]);
+  useEffect(() => { refresh(); }, [refresh]);
 
   const filtered = useMemo(() => {
     const lower = q.toLowerCase();

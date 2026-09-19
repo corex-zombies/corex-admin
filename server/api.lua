@@ -31,14 +31,16 @@ local function vitalsFromMeta(meta)
     }
 end
 
--- corex-inventory item slot shape (verified from server/main.lua):
---   { name = "<id>", count = N, x, y, slot, metadata }
+-- CoreX hands back a flat list of what a player carries:
+--   { name = "<id>", count = N, slot, metadata }
 -- React expects: { itemId = "<id>", count = N }
-local function mapInventory(invObj)
+local function mapInventory(carried)
     local out = {}
-    if not invObj or type(invObj.items) ~= 'table' then return out end
-    for _, slot in ipairs(invObj.items) do
-        out[#out + 1] = { itemId = slot.name, count = slot.count or 1 }
+    if type(carried) ~= 'table' then return out end
+    for _, slot in ipairs(carried) do
+        if type(slot) == 'table' and slot.name then
+            out[#out + 1] = { itemId = slot.name, count = slot.count or 1 }
+        end
     end
     return out
 end
@@ -77,17 +79,17 @@ local function getZoneLabel(src)
     return 'Open world'
 end
 
--- corex-inventory uses an 8x10 grid by default (Config.GridWidth × GridHeight),
--- but server owners can change those. We read the live values so the panel
--- never lies about capacity.
+-- How much a player can carry, asked of whichever inventory CoreX has rather
+-- than of one by name. Grid-based inventories answer with their dimensions;
+-- slot-based ones have no grid at all and answer nothing, which is not a
+-- failure - the panel then shows a plain default instead of inventing a shape.
+local DEFAULT_GRID_SIZE = 24
+
 local function getInventoryGridSize()
-    if GetResourceState('corex-inventory') ~= 'started' then return 24 end
-    -- corex-inventory keeps Config in shared scope, so reading from its
-    -- module table needs a tiny indirection: we expose a helper export.
-    local ok, w = pcall(function() return exports['corex-inventory']:GetGridWidth() end)
-    local ok2, h = pcall(function() return exports['corex-inventory']:GetGridHeight() end)
-    local width  = (ok  and type(w) == 'number' and w > 0) and w or 8
-    local height = (ok2 and type(h) == 'number' and h > 0) and h or 10
+    local grid = CoreXInventoryBridge.GetGridSize()
+    if type(grid) ~= 'table' then return DEFAULT_GRID_SIZE end
+    local width, height = tonumber(grid.width), tonumber(grid.height)
+    if not width or not height or width <= 0 or height <= 0 then return DEFAULT_GRID_SIZE end
     return width * height
 end
 
@@ -109,11 +111,9 @@ local function buildPlayerSummary(src, player, includeMugshot)
     local state = tryCall(function() return exports['corex-core']:GetPlayerState(src) end, 'active')
     if not state or state == '' then state = 'active' end
 
-    local mappedInv = {}
-    if GetResourceState('corex-inventory') == 'started' then
-        local invObj = tryCall(function() return exports['corex-inventory']:GetInventory(src) end, nil)
-        mappedInv = mapInventory(invObj)
-    end
+    -- Read through CoreX so the panel shows a replacement inventory's contents
+    -- too, and shows an empty list rather than failing when there is none.
+    local mappedInv = mapInventory(CoreXInventoryBridge.GetItems(src))
 
     local mugshot = tryCall(function() return GetCachedMugshot(src) end, '') or ''
     if includeMugshot and mugshot == '' then
@@ -256,9 +256,8 @@ function ApiGetOverview()
     }
 end
 
--- corex-inventory's items.lua doesn't declare a `category` field on every
--- item (only melee weapons do). We infer it from the id so the UI can pick
--- the right fallback icon when the image happens to be missing.
+-- Not every inventory declares a `category` on every item. We infer it from the
+-- id so the UI can pick the right fallback icon when the image is missing.
 local function inferCategory(id, raw)
     if type(raw) == 'string' and #raw > 0 then return raw end
     if not id then return 'other' end
@@ -281,20 +280,27 @@ local function inferCategory(id, raw)
 end
 
 function ApiGetItemsCatalog()
-    if GetResourceState('corex-inventory') ~= 'started' then return {} end
-    local catalog = exports['corex-inventory']:GetFullCatalog() or {}
+    -- The item picker is filled by whichever inventory CoreX has. An inventory
+    -- with no item list of its own leaves this empty rather than showing items
+    -- from an inventory that is not running.
+    local catalog = CoreXInventoryBridge.GetCatalog()
     local list = {}
     for id, item in pairs(catalog) do
         list[#list + 1] = {
             id        = id,
             label     = item.label,
-            weight    = item.weight,
+            -- Neutral providers use grams; the Admin NUI displays kilograms.
+            weight    = (tonumber(item.weight) or 0) / 1000,
             size      = item.size,
             stackable = item.stackable,
             maxStack  = item.maxStack,
             category  = inferCategory(id, item.category),
             rarity    = item.rarity or 'common',
             image     = item.image,
+            -- The whole URL, from the inventory that ships the picture. The
+            -- panel bundle still assembles its own from a resource name; when
+            -- it is rebuilt it should use this instead.
+            imageUrl  = CoreXInventoryBridge.GetItemImage(id),
         }
     end
     return list

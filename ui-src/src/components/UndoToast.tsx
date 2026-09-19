@@ -1,13 +1,12 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { Undo2, Check, ChevronDown } from "lucide-react";
+import { Info, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/cn";
 
 export type UndoEvent = {
   id: string;
   message: string;
   expiresAt: number; // ms timestamp
-  onUndo: () => void;
 };
 
 type Props = {
@@ -24,19 +23,16 @@ type Props = {
 // `events` arrives newest-last from App.tsx (push order); we render newest
 // at the bottom of the array which becomes the front of the visual stack.
 export function UndoToast({ events, onDismiss }: Props) {
-  const [expanded, setExpanded] = useState(false);
-
-  // Auto-collapse when there's nothing left to show.
-  useEffect(() => {
-    if (events.length === 0 && expanded) setExpanded(false);
-  }, [events.length, expanded]);
+  const [expandedFor, setExpandedFor] = useState<string | null>(null);
+  const newestEventId = events.at(-1)?.id ?? null;
+  const expanded = newestEventId !== null && expandedFor === newestEventId;
 
   // Auto-collapse when the user clicks elsewhere inside the panel.
   useEffect(() => {
     if (!expanded) return;
     const onClick = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
-      if (!target.closest('[data-toast-stack]')) setExpanded(false);
+      if (!target.closest('[data-toast-stack]')) setExpandedFor(null);
     };
     window.addEventListener("mousedown", onClick);
     return () => window.removeEventListener("mousedown", onClick);
@@ -72,7 +68,7 @@ export function UndoToast({ events, onDismiss }: Props) {
           </AnimatePresence>
           {events.length > 1 && (
             <button
-              onClick={() => setExpanded(false)}
+              onClick={() => setExpandedFor(null)}
               className="pointer-events-auto mx-auto -mb-1 flex h-5 items-center gap-1 rounded-full bg-[#1d1d23]/90 px-2 text-[10px] text-zinc-400 ring-1 ring-white/[0.04] hover:text-zinc-200"
             >
               collapse
@@ -82,8 +78,15 @@ export function UndoToast({ events, onDismiss }: Props) {
         </motion.div>
       ) : (
         // Collapsed 3D stack: front card is full-opacity; backs peek as smaller, dimmer slices.
-        <button
-          onClick={() => events.length > 1 && setExpanded(true)}
+        <div
+          onClick={() => events.length > 1 && setExpandedFor(newestEventId)}
+          role={events.length > 1 ? "button" : undefined}
+          tabIndex={events.length > 1 ? 0 : undefined}
+          onKeyDown={(e) => {
+            if (e.target === e.currentTarget && events.length > 1 && (e.key === "Enter" || e.key === " ")) {
+              e.preventDefault(); setExpandedFor(newestEventId);
+            }
+          }}
           className={cn(
             "pointer-events-auto relative block",
             events.length > 1 && "cursor-pointer",
@@ -125,7 +128,7 @@ export function UndoToast({ events, onDismiss }: Props) {
               </motion.div>
             );
           })}
-        </button>
+        </div>
       )}
     </div>
   );
@@ -161,11 +164,9 @@ function ToastCard({
   totalCount?: number;
 }) {
   const total = 30; // seconds — must match App.tsx pushUndo()
-  const [remaining, setRemaining] = useState(Math.max(0, Math.ceil((event.expiresAt - Date.now()) / 1000)));
-  const [undone, setUndone] = useState(false);
+  const [remaining, setRemaining] = useState(total);
 
   useEffect(() => {
-    if (undone) return;
     const t = setInterval(() => {
       const left = Math.max(0, Math.ceil((event.expiresAt - Date.now()) / 1000));
       setRemaining(left);
@@ -175,7 +176,7 @@ function ToastCard({
       }
     }, 200);
     return () => clearInterval(t);
-  }, [event.expiresAt, onDismiss, undone]);
+  }, [event.expiresAt, onDismiss]);
 
   const pct = (remaining / total) * 100;
 
@@ -193,16 +194,12 @@ function ToastCard({
       )}
 
       <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[#1d1d22] ring-1 ring-white/[0.04]">
-        {undone ? (
-          <Check className="h-3.5 w-3.5 text-emerald-400" strokeWidth={2.25} />
-        ) : (
-          <Undo2 className="h-3.5 w-3.5 text-zinc-300" strokeWidth={2} />
-        )}
+        <Info className="h-3.5 w-3.5 text-zinc-300" strokeWidth={2} />
       </div>
       <div className="min-w-0 flex-1 text-left">
-        <div className="truncate text-[12.5px] text-zinc-100">{undone ? "Action reverted." : event.message}</div>
+        <div className="truncate text-[12.5px] text-zinc-100">{event.message}</div>
         <div className="mt-0.5 flex items-center gap-2 font-mono text-[10.5px] tabular text-zinc-500">
-          <span>{undone ? "no further action needed" : `auto-dismisses in ${remaining}s`}</span>
+          <span>{`auto-dismisses in ${remaining}s`}</span>
           {totalCount > 1 && (
             <>
               <span className="text-zinc-700">·</span>
@@ -213,17 +210,15 @@ function ToastCard({
           )}
         </div>
       </div>
-      {showUndo && !undone && (
+      {showUndo && (
         <button
           onClick={(e) => {
             e.stopPropagation();
-            setUndone(true);
-            event.onUndo();
-            setTimeout(onDismiss, 900);
+            onDismiss();
           }}
           className="motion-soft rounded-md border border-[#383841] bg-[#1d1d23] px-2 py-1 text-[11px] font-medium text-zinc-200 hover:border-[#42424c] hover:bg-[#1d1d24]"
         >
-          Undo
+          Dismiss
         </button>
       )}
     </div>

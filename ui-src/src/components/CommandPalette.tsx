@@ -72,7 +72,7 @@ export function CommandPalette({ open, onClose, players, onAction }: Props) {
                 {/* Live player list — clicking opens that player's drawer. */}
                 {players.length > 0 && (
                   <Command.Group heading="Players" className="cmdk-heading">
-                    {players.slice(0, 8).map((p) => (
+                    {players.map((p) => (
                       <PlayerCmdItem key={p.id} p={p} onSelect={() => { onAction("open", p); onClose(); }} />
                     ))}
                   </Command.Group>

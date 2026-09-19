@@ -56,6 +56,66 @@ local function gate(src)
     return true
 end
 
+-- Evidence capture can yield. A source number (or even the same license)
+-- does not identify the session that was selected before that yield.
+local coreEpoch = 0
+AddEventHandler('onResourceStop', function(resource)
+    if resource == 'corex-core' then coreEpoch = coreEpoch + 1 end
+end)
+
+local function captureSession(src)
+    local ok, session = pcall(function()
+        local player = exports['corex-core']:GetPlayer(src)
+        if not player or type(player.identifier) ~= 'string' then return nil end
+        for _, presence in ipairs(exports['corex-core']:GetPlayerPresence(player.identifier)) do
+            if presence.source == src and type(presence.sessionToken) == 'string'
+                and presence.sessionToken ~= '' then
+                return { identifier = player.identifier, token = presence.sessionToken, epoch = coreEpoch }
+            end
+        end
+    end)
+    return ok and session or nil
+end
+
+local function sameSession(src, expected)
+    if not expected or expected.epoch ~= coreEpoch then return false end
+    local current = captureSession(src)
+    return current and current.identifier == expected.identifier and current.token == expected.token
+end
+
+local function guardedEvidence(action, src, target)
+    local actor, recipient = captureSession(src), captureSession(target)
+    if not actor or not recipient then return false, 'session_unavailable' end
+    local shot = maybeCaptureScreenshot(action, target)
+    if not gate(src) then return false, 'permission_denied' end
+    if not sameSession(src, actor) or not sameSession(target, recipient) then
+        return false, 'session_changed'
+    end
+    return true, nil, shot
+end
+
+local function finiteInteger(value)
+    return type(value) == 'number' and value == value and math.abs(value) < math.huge and value % 1 == 0
+end
+
+local function applyMoney(target, kind, desired, current)
+    local core = exports['corex-core']:GetCoreObject()
+    local limit = core and core.Config and core.Config.MaxMoney or 999999999
+    if not finiteInteger(desired) or desired < 0 then return false, 'insufficient_funds' end
+    if desired > limit then return false, 'balance_limit_exceeded' end
+    local delta = desired - current
+    local changed = true
+    if delta > 0 then changed = exports['corex-core']:AddMoney(target, kind, delta)
+    elseif delta < 0 then changed = exports['corex-core']:RemoveMoney(target, kind, -delta) end
+    if changed ~= true then return false, 'money_change_rejected' end
+    -- Never silently treat a clamped or otherwise different result as the
+    -- requested amount. A mismatch is not a rollback; inspect before retrying.
+    if exports['corex-core']:GetMoney(target, kind) ~= desired then
+        return false, 'money_result_mismatch_check_balance'
+    end
+    return true
+end
+
 -----------------------------------------------------------------------
 -- Kick
 -----------------------------------------------------------------------
@@ -64,7 +124,8 @@ function ActionKick(src, target, reason)
     target = tonumber(target); if not target then return false, 'bad_target' end
     if not GetPlayerName(target) then return false, 'target_offline' end
 
-    local shot = maybeCaptureScreenshot('kick', target)
+    local valid, err, shot = guardedEvidence('kick', src, target)
+    if not valid then return false, err end
     DropPlayer(target, ('[Admin] ' .. (reason or 'no reason')))
     local actorName = GetActor(src)
     logAction(src, actorName, 'kick', { target = target, reason = reason }, true, target, target, shot)
@@ -77,17 +138,17 @@ end
 function ActionGiveMoney(src, target, kind, amount)
     local ok = gate(src); if not ok then return false, 'permission_denied' end
     target = tonumber(target); amount = tonumber(amount)
-    if not target or not amount then return false, 'bad_args' end
+    if not finiteInteger(target) or target <= 0 or not finiteInteger(amount) or amount == 0 then return false, 'bad_args' end
     if kind ~= 'cash' and kind ~= 'bank' then return false, 'bad_kind' end
     if math.abs(amount) > Config.MaxGiveMoney then return false, 'amount_too_large' end
     if not exports['corex-core']:GetPlayer(target) then return false, 'target_offline' end
 
-    local shot = maybeCaptureScreenshot('give_money', target)
-    if amount >= 0 then
-        exports['corex-core']:AddMoney(target, kind, amount)
-    else
-        exports['corex-core']:RemoveMoney(target, kind, -amount)
-    end
+    local valid, err, shot = guardedEvidence('give_money', src, target)
+    if not valid then return false, err end
+    local current = exports['corex-core']:GetMoney(target, kind)
+    if not finiteInteger(current) then return false, 'balance_unavailable' end
+    local changed, changeError = applyMoney(target, kind, current + amount, current)
+    if not changed then return false, changeError end
     TriggerClientEvent('corex:notify', target, ('Admin granted %s$%s on your %s')
         :format(amount >= 0 and '+' or '-', math.abs(amount), kind), 'success', 5000)
 
@@ -99,16 +160,17 @@ end
 function ActionSetMoney(src, target, kind, amount)
     local ok = gate(src); if not ok then return false, 'permission_denied' end
     target = tonumber(target); amount = tonumber(amount)
-    if not target or not amount or amount < 0 then return false, 'bad_args' end
+    if not finiteInteger(target) or target <= 0 or not finiteInteger(amount) or amount < 0 then return false, 'bad_args' end
     if kind ~= 'cash' and kind ~= 'bank' then return false, 'bad_kind' end
     if amount > Config.MaxGiveMoney then return false, 'amount_too_large' end
     if not exports['corex-core']:GetPlayer(target) then return false, 'target_offline' end
 
-    local shot = maybeCaptureScreenshot('set_money', target)
-    local current = exports['corex-core']:GetMoney(target, kind) or 0
-    local delta = amount - current
-    if delta > 0 then exports['corex-core']:AddMoney(target, kind, delta)
-    elseif delta < 0 then exports['corex-core']:RemoveMoney(target, kind, -delta) end
+    local valid, err, shot = guardedEvidence('set_money', src, target)
+    if not valid then return false, err end
+    local current = exports['corex-core']:GetMoney(target, kind)
+    if not finiteInteger(current) then return false, 'balance_unavailable' end
+    local changed, changeError = applyMoney(target, kind, amount, current)
+    if not changed then return false, changeError end
 
     local actorName = GetActor(src)
     logAction(src, actorName, 'set_money', { target = target, kind = kind, amount = amount }, true, 'ok', target, shot)
@@ -116,18 +178,19 @@ function ActionSetMoney(src, target, kind, amount)
 end
 
 -----------------------------------------------------------------------
--- Give / Remove item (via corex-inventory)
+-- Give / Remove item (through whichever inventory CoreX has)
 -----------------------------------------------------------------------
 function ActionGiveItem(src, target, itemId, count)
     local ok = gate(src); if not ok then return false, 'permission_denied' end
-    target = tonumber(target); count = tonumber(count) or 1
-    if not target or not itemId then return false, 'bad_args' end
-    if count <= 0 or count > Config.MaxGiveItemCount then return false, 'bad_count' end
-    if GetResourceState('corex-inventory') ~= 'started' then return false, 'no_inventory' end
+    target = tonumber(target); count = count == nil and 1 or tonumber(count)
+    if not finiteInteger(target) or target <= 0 or type(itemId) ~= 'string' or itemId == '' then return false, 'bad_args' end
+    if not finiteInteger(count) or count <= 0 or count > Config.MaxGiveItemCount then return false, 'bad_count' end
+    if not CoreXInventoryBridge.IsAvailable() then return false, 'no_inventory' end
     if not exports['corex-core']:GetPlayer(target) then return false, 'target_offline' end
 
-    local shot = maybeCaptureScreenshot('give_item', target)
-    local added = exports['corex-inventory']:AddItem(target, itemId, count)
+    local valid, err, shot = guardedEvidence('give_item', src, target)
+    if not valid then return false, err end
+    local added = CoreXInventoryBridge.AddItem(target, itemId, count)
     local actorName = GetActor(src)
     logAction(src, actorName, 'give_item', { target = target, item = itemId, count = count }, added and true or false, tostring(added), target, shot)
     return added and true or false
@@ -135,43 +198,37 @@ end
 
 function ActionRemoveItem(src, target, itemId, count)
     local ok = gate(src); if not ok then return false, 'permission_denied' end
-    target = tonumber(target); count = tonumber(count) or 1
-    if not target or not itemId then return false, 'bad_args' end
-    if count <= 0 then return false, 'bad_count' end
-    if GetResourceState('corex-inventory') ~= 'started' then return false, 'no_inventory' end
+    target = tonumber(target); count = count == nil and 1 or tonumber(count)
+    if not finiteInteger(target) or target <= 0 or type(itemId) ~= 'string' or itemId == '' then return false, 'bad_args' end
+    if not finiteInteger(count) or count <= 0 then return false, 'bad_count' end
+    if not CoreXInventoryBridge.IsAvailable() then return false, 'no_inventory' end
 
-    local shot = maybeCaptureScreenshot('remove_item', target)
-    local removed = exports['corex-inventory']:RemoveItem(target, itemId, count)
+    local valid, err, shot = guardedEvidence('remove_item', src, target)
+    if not valid then return false, err end
+    local removed = CoreXInventoryBridge.RemoveItem(target, itemId, count)
     local actorName = GetActor(src)
     logAction(src, actorName, 'remove_item', { target = target, item = itemId, count = count }, removed and true or false, tostring(removed), target, shot)
     return removed and true or false
 end
 
 -----------------------------------------------------------------------
--- Revive / Warn (lightweight wrappers — corex-death may extend later)
+-- Revive / Warn
 -----------------------------------------------------------------------
--- Admin "revive" doubles as a full-heal: works whether the target is alive
--- (in which case it just restores HP + clears bad vitals) or dead (then it
--- also flips lifecycleState back to 'active' so the death cycle releases).
+-- The death resource owns resurrection and releasing its UI/control locks.
+-- A raw health write is not a revive. Other Admin actions do not require Death.
 function ActionRevive(src, target)
     local ok = gate(src); if not ok then return false, 'permission_denied' end
     target = tonumber(target); if not target then return false, 'bad_target' end
     if not exports['corex-core']:GetPlayer(target) then return false, 'target_offline' end
 
-    local shot = maybeCaptureScreenshot('revive', target)
-    -- Restore lifecycle first so any death-cycle gates release before we set
-    -- HP (otherwise the player can be re-killed by survival's regen blocker).
-    exports['corex-core']:SetPlayerState(target, 'active')
-    -- Full HP + clear the meters that drive damage gates.
-    TriggerClientEvent('corex:client:setHealth', target, 200)
-    pcall(exports['corex-core'].SetMetaData, exports['corex-core'], target, 'hunger',    100)
-    pcall(exports['corex-core'].SetMetaData, exports['corex-core'], target, 'thirst',    100)
-    pcall(exports['corex-core'].SetMetaData, exports['corex-core'], target, 'stress',    0)
-    pcall(exports['corex-core'].SetMetaData, exports['corex-core'], target, 'infection', 0)
-    pcall(exports['corex-core'].SetMetaData, exports['corex-core'], target, 'bleeding',  0)
-    pcall(exports['corex-core'].SetMetaData, exports['corex-core'], target, 'cold',      0)
-    pcall(exports['corex-core'].SetMetaData, exports['corex-core'], target, 'sick',      0)
-    pcall(exports['corex-core'].SetMetaData, exports['corex-core'], target, 'poison',    0)
+    local valid, err, shot = guardedEvidence('revive', src, target)
+    if not valid then return false, err end
+    if GetResourceState('corex-death') ~= 'started' then return false, 'death_resource_unavailable' end
+    local called, revived, reviveError = pcall(function()
+        return exports['corex-death']:RevivePlayer(target)
+    end)
+    if not called then return false, 'revive_reply_unknown_check_player' end
+    if revived ~= true then return false, reviveError or 'revive_rejected' end
 
     TriggerClientEvent('corex:notify', target, 'Admin restored your health', 'success', 4000, 'Admin')
 
@@ -185,9 +242,13 @@ function ActionWarn(src, target, reason)
     target = tonumber(target); if not target then return false, 'bad_target' end
     if not exports['corex-core']:GetPlayer(target) then return false, 'target_offline' end
 
-    local shot = maybeCaptureScreenshot('warn', target)
+    local valid, err, shot = guardedEvidence('warn', src, target)
+    if not valid then return false, err end
     local current = exports['corex-core']:GetMetaData(target, 'warnings') or 0
-    exports['corex-core']:SetMetaData(target, 'warnings', current + 1)
+    if not finiteInteger(current) or current < 0 then return false, 'warnings_unavailable' end
+    if exports['corex-core']:SetMetaData(target, 'warnings', current + 1) ~= true then
+        return false, 'warning_change_rejected'
+    end
     TriggerClientEvent('corex:notify', target,
         ('Admin warning: %s'):format(reason or 'no reason given'), 'warning', 8000, 'Admin')
 

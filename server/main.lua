@@ -30,7 +30,8 @@ end)
 
 lib.callback.register('corex-admin:bans', function(source, filter)
     if not IsAdmin(source) then return deny() end
-    return { ok = true, data = BansList(filter) }
+    local rows, err = BansList(filter)
+    return { ok = rows ~= nil, data = rows, error = err }
 end)
 
 lib.callback.register('corex-admin:actions.recent', function(source, limit)

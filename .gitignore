@@ -5,6 +5,8 @@ ui-src/node_modules
 ui-src/dist
 ui-src/.vite
 ui-src/*.tsbuildinfo
+__pycache__/
+*.py[cod]
 
 # OS / editor noise
 .DS_Store

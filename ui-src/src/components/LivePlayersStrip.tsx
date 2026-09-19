@@ -1,7 +1,7 @@
 import { useRef } from "react";
 import { ArrowLeft, ArrowRight, Wifi, ShieldAlert } from "lucide-react";
 import { Avatar } from "./Avatar";
-import { statusColor } from "./StatusDot";
+import { statusColor } from "@/lib/statusMeta";
 import type { Player } from "@/lib/data";
 import { cn } from "@/lib/cn";
 

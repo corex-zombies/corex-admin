@@ -9,13 +9,8 @@
 -- an export, we return safe zeros rather than crashing the overview.
 
 -- ----- ZOMBIES ------------------------------------------------------------
--- corex-zombies is client-authoritative (each client streams its own pool
--- of zombies). We collect per-client counts via a periodic broadcast and
--- aggregate here. Daily kills are tallied by a server event the client
--- fires on every kill.
-
-local clientZombieCounts = {}      -- src → number reported
-local lastReport         = {}      -- src → os.time() of last report
+-- Shared peds are counted once by the server owner. Only that resource can
+-- deliver its consumed native lifetime decision; client reports are not kills.
 local killedToday        = 0
 local lastResetDate      = os.date('%Y-%m-%d')
 
@@ -27,26 +22,36 @@ local function rolloverIfNeeded()
     end
 end
 
-RegisterNetEvent('corex-admin:server:reportZombieCount', function(count)
-    local src = source
-    if type(count) ~= 'number' or count < 0 or count > 1000 then return end
-    clientZombieCounts[src] = math.floor(count)
-    lastReport[src] = os.time()
-end)
-
-RegisterNetEvent('corex-admin:server:reportZombieKill', function()
-    local src = source
-    if not src or src <= 0 then return end
+exports('RecordZombieKill', function(src, expected)
+    if GetInvokingResource() ~= 'corex-zombies' or type(expected) ~= 'table'
+        or expected.source ~= src then return false end
+    local checked, current = pcall(function()
+        if GetResourceState('corex-core') ~= 'started' then return false end
+        local player = exports['corex-core']:GetPlayer(src)
+        if not player or player.source ~= src or player.identifier ~= expected.identifier then return false end
+        local matched = false
+        for _, presence in ipairs(exports['corex-core']:GetPlayerPresence(expected.identifier) or {}) do
+            if presence.source == src and presence.sessionToken == expected.sessionToken then matched = true; break end
+        end
+        return matched and GetResourceState('corex-core') == 'started'
+            and GetPlayerPed(src) == expected.ped and expected.ped ~= 0
+            and GetPlayerRoutingBucket(src) == expected.bucket
+    end)
+    if not checked or not current then return false end
     rolloverIfNeeded()
+    -- This in-memory daily statistic counts validated deaths. The persistent
+    -- per-player statistic has its own acknowledgement and is never retried.
     killedToday = killedToday + 1
-
-    -- Tally per-player lifetime kills in corex-core metadata so the panel
-    -- can show "ABUGIZA killed 1,420 zombies" in the HISTORY section. We
-    -- read-modify-write rather than incrementing a state-bag because metadata
-    -- persists to DB on logout/auto-save and survives restarts.
-    local current = exports['corex-core']:GetMetaData(src, 'zombies_killed') or 0
-    if type(current) ~= 'number' then current = tonumber(current) or 0 end
-    exports['corex-core']:SetMetaData(src, 'zombies_killed', current + 1)
+    local ok, saved = pcall(function()
+        local count = tonumber(exports['corex-core']:GetMetaData(src, 'zombies_killed')) or 0
+        if count ~= count or math.abs(count) == math.huge then return false end
+        return exports['corex-core']:SetMetaData(src, 'zombies_killed', math.max(0,math.floor(count)) + 1)
+    end)
+    if not ok or saved ~= true then
+        print('[COREX-ADMIN] Zombie lifetime statistic write could not be confirmed; no automatic retry.')
+        return false
+    end
+    return true
 end)
 
 -- ----- LOCATION ----------------------------------------------------------
@@ -75,22 +80,15 @@ end
 
 AddEventHandler('playerDropped', function()
     local src = source
-    clientZombieCounts[src] = nil
-    lastReport[src] = nil
     playerLocations[src] = nil
 end)
 
--- Sum live, recent reports. A stale report (>15s old) means that client
--- isn't running corex-zombies anymore — drop it from the total.
+-- Never sum client observations: two clients may see the same shared ped.
 local function ZombiesAlive()
-    local total = 0
-    local now = os.time()
-    for src, count in pairs(clientZombieCounts) do
-        if (now - (lastReport[src] or 0)) <= 15 then
-            total = total + count
-        end
-    end
-    return total
+    if GetResourceState('corex-zombies') ~= 'started' then return 0 end
+    local ok,count = pcall(function() return exports['corex-zombies']:GetAliveCount() end)
+    if not ok or type(count) ~= 'number' or count ~= count or count < 0 or count > 65535 then return 0 end
+    return math.floor(count)
 end
 
 -- ----- RED ZONES ----------------------------------------------------------
@@ -197,6 +195,7 @@ end
 -- ----- PUBLIC API --------------------------------------------------------
 
 function ApiGetWorldStats()
+    rolloverIfNeeded()
     return {
         zombies = {
             alive       = ZombiesAlive(),

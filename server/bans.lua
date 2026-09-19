@@ -4,10 +4,38 @@
 
 local DURATION_SECONDS = Config.BanDurations or {}
 
-local function durationToExpires(duration)
-    local sec = DURATION_SECONDS[duration]
-    if not sec or sec < 0 then return nil end
-    return os.date('!%Y-%m-%d %H:%M:%S', os.time() + sec)
+local coreEpoch = 0
+AddEventHandler('onResourceStop', function(resource)
+    if resource == 'corex-core' then coreEpoch = coreEpoch + 1 end
+end)
+
+local function captureSession(src)
+    local ok, session = pcall(function()
+        local player = exports['corex-core']:GetPlayer(src)
+        if not player or type(player.identifier) ~= 'string' or player.identifier == '' then return nil end
+        for _, presence in ipairs(exports['corex-core']:GetPlayerPresence(player.identifier)) do
+            if presence.source == src and type(presence.sessionToken) == 'string' and presence.sessionToken ~= '' then
+                return {identifier=player.identifier, token=presence.sessionToken, epoch=coreEpoch}
+            end
+        end
+    end)
+    return ok and session or nil
+end
+
+local function sameSession(src, expected)
+    if not expected or expected.epoch ~= coreEpoch then return false end
+    local current = captureSession(src)
+    return current and current.identifier == expected.identifier and current.token == expected.token
+end
+
+local function positiveInteger(value)
+    return type(value) == 'number' and value > 0 and value < math.huge and value % 1 == 0
+end
+
+local function isoDate(epoch)
+    epoch = tonumber(epoch)
+    if not positiveInteger(epoch) then return nil end
+    return os.date('!%Y-%m-%dT%H:%M:%SZ', epoch)
 end
 
 -- Auto-create the table on resource start so first-time installers don't need to
@@ -42,40 +70,67 @@ end)
 ---List bans, newest first. Filter is 'active'|'expired'|'lifted'|'all'.
 function BansList(filter)
     filter = filter or 'active'
+    if filter ~= 'all' and filter ~= 'active' and filter ~= 'expired' and filter ~= 'lifted' then
+        return nil, 'bad_filter'
+    end
     local where = filter == 'all' and '' or 'WHERE status = ?'
     local args  = filter == 'all' and {}  or { filter }
-    local rows = MySQL.query.await(('SELECT * FROM corex_bans %s ORDER BY banned_at DESC LIMIT 250'):format(where), args) or {}
-
-    -- Auto-mark expired bans without waiting for a cron job
-    local now = os.time()
+    -- Effective expiry is computed before filtering. A read never races a lift
+    -- by writing an old status back, and never issues one query per row.
+    local queried, rows = pcall(MySQL.query.await, ([[
+        SELECT * FROM (
+            SELECT id, identifier, player_name, reason, duration, banned_by,
+                UNIX_TIMESTAMP(banned_at) AS banned_epoch,
+                UNIX_TIMESTAMP(expires_at) AS expires_epoch,
+                CASE WHEN status = 'active' AND expires_at <= CURRENT_TIMESTAMP
+                    THEN 'expired' ELSE status END AS status
+            FROM corex_bans
+        ) AS effective_bans %s ORDER BY banned_epoch DESC, id DESC LIMIT 250
+    ]]):format(where), args)
+    if not queried or type(rows) ~= 'table' then return nil, 'bans_unavailable' end
+    local result = {}
     for _, row in ipairs(rows) do
-        if row.status == 'active' and row.expires_at then
-            local t = MySQL.scalar.await('SELECT UNIX_TIMESTAMP(?)', { row.expires_at }) or 0
-            if t > 0 and t <= now then
-                row.status = 'expired'
-                MySQL.update('UPDATE corex_bans SET status = "expired" WHERE id = ?', { row.id })
-            end
-        end
+        result[#result + 1] = {
+            id=tostring(row.id), identifier=row.identifier, player=row.player_name,
+            reason=row.reason, duration=row.duration, by=row.banned_by,
+            at=isoDate(row.banned_epoch), expiresAt=isoDate(row.expires_epoch), status=row.status,
+        }
     end
-    return rows
+    return result
 end
 
 ---Create a ban + kick the player if online. Returns the new row id.
 function BansCreate(actorSrc, targetSrc, duration, reason)
     if not IsAdmin(actorSrc) then return nil, 'permission_denied' end
-    targetSrc = tonumber(targetSrc); if not targetSrc then return nil, 'bad_target' end
+    targetSrc = tonumber(targetSrc)
+    if not positiveInteger(targetSrc) then return nil, 'bad_target' end
+    duration = duration or 'perma'
+    local seconds = DURATION_SECONDS[duration]
+    if seconds ~= -1 and not positiveInteger(seconds) then return nil, 'bad_duration' end
+    if reason ~= nil and type(reason) ~= 'string' then return nil, 'bad_reason' end
+    local actorSession, targetSession = captureSession(actorSrc), captureSession(targetSrc)
+    if not actorSession or not targetSession then return nil, 'session_unavailable' end
 
     local player = exports['corex-core']:GetPlayer(targetSrc)
     if not player then return nil, 'target_offline' end
     -- corex-core player object is flat (no PlayerData wrapper)
     local pName = player.name or GetPlayerName(targetSrc) or '?'
-    local pIdent = player.identifier or '?'
+    local pIdent = targetSession.identifier
     local actorName, actorIdent = GetActor(actorSrc)
 
-    local expiresAt = durationToExpires(duration)
-    local id = MySQL.insert.await([[
+    -- Evidence can yield; collect it before submitting the irreversible write.
+    local shot
+    if Config.LogToDiscord and Config.DiscordWebhook ~= '' and Config.CaptureEvidenceScreenshots then
+        shot = CaptureScreenshotBytes(targetSrc)
+    end
+    if not IsAdmin(actorSrc) then return nil, 'permission_denied' end
+    if not sameSession(actorSrc, actorSession) or not sameSession(targetSrc, targetSession) then
+        return nil, 'session_changed'
+    end
+
+    local inserted, id = pcall(MySQL.insert.await, [[
         INSERT INTO corex_bans (identifier, player_name, reason, duration, banned_by, banned_by_id, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, CASE WHEN ? = -1 THEN NULL ELSE TIMESTAMPADD(SECOND, ?, CURRENT_TIMESTAMP) END)
     ]], {
         pIdent,
         pName,
@@ -83,16 +138,21 @@ function BansCreate(actorSrc, targetSrc, duration, reason)
         duration or 'perma',
         actorName,
         actorIdent,
-        expiresAt,
+        seconds,
+        seconds,
     })
 
-    -- Capture evidence BEFORE the player is dropped (after = no client to ask).
-    local shot
-    if Config.LogToDiscord and Config.DiscordWebhook ~= '' and Config.CaptureEvidenceScreenshots then
-        shot = CaptureScreenshotBytes(targetSrc)
+    if not inserted or not positiveInteger(id) then
+        -- An absent reply is not proof that SQL rolled back. Do not retry or
+        -- claim a ban/kick succeeded; the operator must inspect the ban list.
+        return nil, 'ban_save_unconfirmed_check_ban_list'
     end
 
-    DropPlayer(targetSrc, ('[BANNED] %s — %s'):format(duration or 'perma', reason or 'no reason'))
+    -- The saved identity remains banned if either party disconnected during
+    -- SQL. A recycled source must never receive the previous session's kick.
+    if IsAdmin(actorSrc) and sameSession(actorSrc, actorSession) and sameSession(targetSrc, targetSession) then
+        DropPlayer(targetSrc, ('[BANNED] %s — %s'):format(duration, reason or 'no reason'))
+    end
     print(('^3[corex-admin]^7 banned %s (%s) duration=%s by %s'):format(
         pName, pIdent, duration or 'perma', actorName))
 
@@ -112,33 +172,35 @@ end
 ---Lift an active ban by id. Returns true on success.
 function BansLift(actorSrc, banId)
     if not IsAdmin(actorSrc) then return false, 'permission_denied' end
-    banId = tonumber(banId); if not banId then return false, 'bad_id' end
+    banId = tonumber(banId); if not positiveInteger(banId) then return false, 'bad_id' end
     local actorName = GetActor(actorSrc)
-    local affected = MySQL.update.await([[
+    local updated, affected = pcall(MySQL.update.await, [[
         UPDATE corex_bans
         SET status = 'lifted', lifted_at = CURRENT_TIMESTAMP, lifted_by = ?
         WHERE id = ? AND status = 'active'
+            AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
     ]], { actorName, banId })
-    return affected and affected > 0
+    if not updated or type(affected) ~= 'number' then return false, 'ban_update_unconfirmed_refresh_before_retry' end
+    if affected ~= 1 then return false, 'ban_not_active' end
+    return true
 end
 
 ---Extend an active ban by N seconds. Returns true on success.
 function BansExtend(actorSrc, banId, addSeconds)
     if not IsAdmin(actorSrc) then return false, 'permission_denied' end
     banId = tonumber(banId); addSeconds = tonumber(addSeconds)
-    if not banId or not addSeconds or addSeconds <= 0 then return false, 'bad_args' end
-
-    local row = MySQL.single.await('SELECT expires_at FROM corex_bans WHERE id = ? AND status = "active"', { banId })
-    if not row then return false, 'not_found' end
-
-    local current = os.time()
-    if row.expires_at then
-        local t = MySQL.scalar.await('SELECT UNIX_TIMESTAMP(?)', { row.expires_at }) or current
-        current = math.max(current, t)
+    if not positiveInteger(banId) or not positiveInteger(addSeconds) or addSeconds > 2147483647 then
+        return false, 'bad_args'
     end
-    local newExpires = os.date('!%Y-%m-%d %H:%M:%S', current + addSeconds)
-    local affected = MySQL.update.await('UPDATE corex_bans SET expires_at = ? WHERE id = ?', { newExpires, banId })
-    return affected and affected > 0
+    -- One atomic relative write: no lost increments or permanent-to-timed
+    -- downgrade, and a concurrent lift cannot be overwritten.
+    local updated, affected = pcall(MySQL.update.await, [[
+        UPDATE corex_bans SET expires_at = TIMESTAMPADD(SECOND, ?, expires_at)
+        WHERE id = ? AND status = 'active' AND expires_at > CURRENT_TIMESTAMP
+    ]], { addSeconds, banId })
+    if not updated or type(affected) ~= 'number' then return false, 'ban_update_unconfirmed_refresh_before_retry' end
+    if affected ~= 1 then return false, 'ban_not_active_or_permanent' end
+    return true
 end
 
 -- ---------- Connect filter: block banned identifiers ----------------------
@@ -157,31 +219,29 @@ AddEventHandler('playerConnecting', function(_, setKickReason, deferrals)
         return
     end
 
-    local row = MySQL.single.await([[
-        SELECT id, reason, duration, expires_at
+    local queried, row = pcall(MySQL.single.await, [[
+        SELECT id, reason, duration, UNIX_TIMESTAMP(expires_at) AS expires_epoch
         FROM corex_bans
         WHERE identifier = ? AND status = 'active'
-        ORDER BY banned_at DESC LIMIT 1
+            AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+        ORDER BY banned_at DESC, id DESC LIMIT 1
     ]], { license })
+
+    if not queried then
+        deferrals.done('COREX could not verify access. Please try again later or contact the server owner.')
+        return
+    end
 
     if not row then
         deferrals.done()
         return
     end
 
-    if row.expires_at then
-        local t = MySQL.scalar.await('SELECT UNIX_TIMESTAMP(?)', { row.expires_at }) or 0
-        if t > 0 and t <= os.time() then
-            MySQL.update('UPDATE corex_bans SET status = "expired" WHERE id = ?', { row.id })
-            deferrals.done()
-            return
-        end
-    end
-
+    local expires = isoDate(row.expires_epoch)
     local msg = ('[BANNED] %s — %s%s'):format(
         row.duration,
         row.reason,
-        row.expires_at and (' — expires ' .. row.expires_at .. ' UTC') or ''
+        expires and (' — expires ' .. expires) or ''
     )
     setKickReason(msg)
     deferrals.done(msg)

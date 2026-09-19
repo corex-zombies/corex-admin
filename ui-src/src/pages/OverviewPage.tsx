@@ -1,6 +1,6 @@
 import {
   Activity, Skull, MapPin, Gavel, Megaphone,
-  Sun, Users, Gauge,
+  Sun, Users,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Sparkline } from "@/components/Sparkline";
@@ -73,12 +73,11 @@ export function OverviewPage({ selected, setSelected, onPaletteOpen, onNavigate,
             </span>
           </>
         }
-        title="Good evening, Mohammed."
+        title="Server overview"
         description={
           <span className="inline-flex flex-wrap items-center gap-1.5">
             <DescChip icon={Users}  label={`${activeCount} active`} dot="bg-emerald-400" />
             <DescChip icon={Gavel}  label={`${activeBans} active bans`} tone="danger" />
-            <DescChip icon={Gauge}  label="server tick 2.4ms" />
           </span>
         }
         actions={

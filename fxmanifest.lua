@@ -15,6 +15,7 @@ shared_scripts {
 
 server_scripts {
     '@oxmysql/lib/MySQL.lua',
+    'server/inventory_bridge.lua',
     'server/permissions.lua',
     'server/screenshots.lua',
     'server/mugshots.lua',
@@ -33,7 +34,6 @@ client_scripts {
     'client/nui.lua',
     'client/mugshots.lua',
     'client/actions.lua',
-    'client/zombies_report.lua',
     'client/location_report.lua',
 }
 
@@ -46,7 +46,6 @@ files {
 
 dependencies {
     'corex-core',
-    'corex-inventory',
     'oxmysql',
     'ox_lib',
 }
